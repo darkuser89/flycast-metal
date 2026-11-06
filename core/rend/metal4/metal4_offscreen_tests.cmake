@@ -20,6 +20,7 @@ function(add_flycast_metal_offscreen_test target root freetype_target xxhash_tar
         ${root}/tests/metal/metal_plan_profile_validation.inc
         ${root}/tests/metal/metal_pool_profile_validation.inc
         ${root}/tests/metal/metal_cache_profile_validation.inc
+        ${root}/tests/metal/metal_oit_memory_validation.inc
         ${root}/tests/metal/metal_offscreen_test_hooks.h
         ${root}/core/rend/metal4/metal4_context.mm ${root}/core/rend/metal4/metal4_renderer.mm
         ${root}/core/rend/metal4/metal4_texture.mm ${root}/core/rend/metal4/metal4_commands.mm

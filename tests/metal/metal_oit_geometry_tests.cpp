@@ -102,6 +102,13 @@ bool contains(metal_oit::Tile b,double x,double y)
 {
 	return x>=b.x && y>=b.y && x<=uint64_t(b.x)+b.width && y<=uint64_t(b.y)+b.height;
 }
+uint64_t boundsDigest(uint64_t digest,metal_oit::Tile bounds)
+{
+	for(auto value:{bounds.x,bounds.y,bounds.width,bounds.height}) {
+		for(unsigned shift=0;shift<32;shift+=8) {digest^=(value>>shift)&255;digest*=1099511628211ULL;}
+	}
+	return digest;
+}
 void verifyNaomi2Coverage(const Frame& f,const Matrix& mv,const Matrix& projection,
 		const Vertices& vertices,const u32 *indices,metal_oit::Tile bounds,uint64_t& samples)
 {
@@ -142,7 +149,7 @@ void validateNaomi2Bounds()
 	projection[0][0]=320;projection[1][1]=240;
 	projection[2][0]=320;projection[2][1]=240;projection[2][3]=1;
 	Vertices vertices;vertices.data.resize(3);u32 index[]{0,1,2};
-	uint64_t samples=0;size_t nonFull=0;
+	uint64_t samples=0,digest=1469598103934665603ULL;size_t nonFull=0;
 	for (unsigned fixture=0;fixture<3000;++fixture) {
 		f.width=1+random()%7680;f.height=1+random()%4320;
 		Matrix mv=identity(),proj=projection;
@@ -164,6 +171,7 @@ void validateNaomi2Bounds()
 		metal_oit::GeometryBounds geometry(f.ndc,f.width,f.height,vertices.size());
 		geometry.setNaomi2Projection(mv,proj);
 		const auto bounds=geometry.triangleNaomi2(index,vertices);
+		digest=boundsDigest(digest,bounds);
 		nonFull+=!equal(bounds,{0,0,f.width,f.height});
 		verifyNaomi2Coverage(f,mv,proj,vertices,index,bounds,samples);
 	}
@@ -205,9 +213,9 @@ void validateNaomi2Bounds()
 	assert(equal(disabled.triangleNaomi2(index,vertices),{0,0,f.width,f.height}));
 	// All indices collide in the small direct-mapped strip cache. The first
 	// projected corner must not be overwritten while calculating the third.
-	vertices.data.resize(9);
-	vertices.data[0]={-.6f,-.4f,1};vertices.data[4]={.6f,-.4f,1};vertices.data[8]={0,.4f,1};
-	u32 collision[]{0,4,8};geometry.setNaomi2Projection(mv,projection);
+	vertices.data.resize(129);
+	vertices.data[0]={-.6f,-.4f,1};vertices.data[64]={.6f,-.4f,1};vertices.data[128]={0,.4f,1};
+	u32 collision[]{0,64,128};geometry.setNaomi2Projection(mv,projection);
 	verifyNaomi2Coverage(f,mv,projection,vertices,collision,geometry.triangleNaomi2(collision,vertices),samples);
 	// Frame reset invalidates both the projection selection and dimensions.
 	geometry.reset(f.ndc,640,480,vertices.size());
@@ -228,6 +236,7 @@ void validateNaomi2Bounds()
 		vertices.data[base]={x-.001f*z,y-.001f*z,z};vertices.data[base+1]={x+.001f*z,y-.001f*z,z};vertices.data[base+2]={x,y+.001f*z,z};
 		u32 indices[]{u32(base),u32(base+1),u32(base+2)};
 		const auto bounds=geometry.triangleNaomi2(indices,vertices);
+		digest=boundsDigest(digest,bounds);
 		before.push_back({0,0,f.width,f.height});after.push_back(bounds);
 		metal_oit::TilePlanner::addCoverage(beforeArea,before.back());metal_oit::TilePlanner::addCoverage(afterArea,bounds);
 		for(bool fused:{false,true})for(auto i:indices) {
@@ -239,6 +248,7 @@ void validateNaomi2Bounds()
 	const size_t newTiles=planner.plan(f.width,f.height,after,capacity,afterArea).size();
 	assert(oldTiles==2048 && newTiles==1);
 	printf("PASS: NAOMI 2: 3000 independent float/FMA shader-projection fixtures, %llu coverage samples, %zu non-full bounds; matrix/PVR/invalid fallbacks; 20000-triangle synthetic scene tiles %zu -> %zu\n",(unsigned long long)samples,nonFull,oldTiles,newTiles);
+	printf("INFO: NAOMI 2 fixture bounds digest %016llx\n",(unsigned long long)digest);
 	// Diagnostic cost only, with preallocated inputs/results and one matrix
 	// selection per triangle (the worst case of one triangle per polygon).
 	// Do not time fixture creation, the independent oracle or old full bounds.
@@ -257,6 +267,62 @@ void validateNaomi2Bounds()
 	}
 	std::sort(planningMs.begin(),planningMs.end());
 	printf("INFO: 20000-triangle projected-bounds + tile planning median %.3f ms (7 runs, one matrix selection per triangle; synthetic CPU cost only)\n",planningMs[3]);
+}
+void validateNaomi2StripCache()
+{
+	Frame f{};f.width=2560;f.height=1920;
+	f.ndc[0][0]=2.f/640;f.ndc[1][1]=-2.f/480;f.ndc[2][2]=1;
+	f.ndc[3][0]=-1;f.ndc[3][1]=1;f.ndc[3][3]=1;
+	Matrix projection{};projection[0][0]=320;projection[1][1]=240;
+	projection[2][0]=320;projection[2][1]=240;projection[2][3]=1;
+	Vertices vertices;vertices.data.resize(16384);
+	for(u32 i=0;i<vertices.size();++i) {
+		const float z=1+float(i%7),x=float(i%128)/127*1.8f-.9f,y=float(i/128)/127*1.8f-.9f;
+		vertices.data[i]={x*z,y*z,z};
+	}
+	constexpr unsigned polygons=64,stripSize=256,triangles=stripSize-2;
+	std::mt19937 random(0x53545250);
+	for(unsigned fixture=0;fixture<3;++fixture) {
+		const char *name=fixture==0?"stride4":fixture==1?"stride64-collisions":"random-nonconsecutive";
+		std::vector<u32> indices(stripSize);
+		if(fixture<2)for(u32 i=0;i<stripSize;++i)indices[i]=i*(fixture==0?4:64);
+		else {
+			std::vector<u32> pool(vertices.size());
+			for(u32 i=0;i<pool.size();++i)pool[i]=i;
+			std::shuffle(pool.begin(),pool.end(),random);std::copy_n(pool.begin(),stripSize,indices.begin());
+		}
+		std::vector<metal_oit::Tile> bounds(polygons*triangles);
+		metal_oit::GeometryBounds geometry(f.ndc,f.width,f.height,vertices.size());
+		std::array<double,7> elapsed;
+		size_t expectedReads=0;
+		for(unsigned run=0;run<elapsed.size();++run) {
+			vertices.reads=0;
+			const auto started=std::chrono::steady_clock::now();
+			for(unsigned polygon=0;polygon<polygons;++polygon) {
+				Matrix mv=identity();mv[3][0]=float(int(polygon%7)-3)*.025f;
+				// A new polygon can reuse the same indices with different matrices.
+				geometry.setNaomi2Projection(mv,projection);
+				for(unsigned triangle=0;triangle<triangles;++triangle)
+					bounds[polygon*triangles+triangle]=geometry.triangleNaomi2(indices.data()+triangle,vertices);
+			}
+			elapsed[run]=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+			if(!run)expectedReads=vertices.reads;else assert(vertices.reads==expectedReads);
+			assert(vertices.reads>=polygons*stripSize && vertices.reads<=polygons*triangles*3);
+		}
+		uint64_t digest=1469598103934665603ULL,samples=0;
+		for(unsigned polygon=0;polygon<polygons;++polygon) {
+			Matrix mv=identity();mv[3][0]=float(int(polygon%7)-3)*.025f;
+			for(unsigned triangle=0;triangle<triangles;++triangle) {
+				const auto b=bounds[polygon*triangles+triangle];digest=boundsDigest(digest,b);
+				for(bool fused:{false,true})for(unsigned corner=0;corner<3;++corner) {
+					const auto p=shaderNaomi2(f,mv,projection,vertices[indices[triangle+corner]],fused);
+					assert(contains(b,p.x,p.y));++samples;
+				}
+			}
+		}
+		std::sort(elapsed.begin(),elapsed.end());
+		printf("PASS: NAOMI 2 strip cache %s: %u polygons, %u triangles, %zu vertex projections, %llu shader-corner samples, bounds %016llx; median %.3f ms (7 runs, synthetic CPU only)\n",name,polygons,polygons*triangles,expectedReads,(unsigned long long)samples,(unsigned long long)digest,elapsed[3]);
+	}
 }
 int main()
 {
@@ -330,5 +396,6 @@ int main()
 	assert(equal(disabled.triangle(index,v),{0,0,f.width,f.height}));
 	puts("PASS: 160000 exact comparisons against old geometry bounds, 5000 polygon/tile coverage fixtures; 100000 shared triangles read only 3 vertices; invalid/projection fallbacks preserved");
 	validateNaomi2Bounds();
+	validateNaomi2StripCache();
 	printf("INFO: geometry regression total %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-testStarted).count());
 }

@@ -34,6 +34,7 @@
 #include <filesystem>
 #include <unordered_set>
 #include <thread>
+#include <mach/mach.h>
 #include <stb_image_write.h>
 #include "metal4_preload.h"
 #include "../../../tests/metal/metal_offscreen_test_hooks.h"
@@ -2122,6 +2123,7 @@ public:
 	void validateSyntheticPlanProfile();
 	void validateSyntheticPoolProfile();
 	void validateSyntheticCacheProfile();
+	void validateSyntheticOITMemory();
 	void validateSyntheticMaterialAdmission();
 	void validateSyntheticResolveAdmission();
 	void validateSyntheticStorageAdmission();
@@ -2971,6 +2973,14 @@ public:
 	void SetPresentationTime(double time) override { presentationVideoTime = time; }
 	bool Present() override
 	{
+		@autoreleasepool {
+			// Render's pool has drained before this deferred commit and OSD draw.
+			// GPU feedback retains in-flight resources after this pool drains.
+			return presentFrame();
+		}
+	}
+	bool presentFrame()
+	{
 		recoverCanceledRender();
 		// Only a successful screen-image handoff retires its continuation
 		// depth. Skipped swaps and GUI-only flushes may precede another render.
@@ -3058,6 +3068,7 @@ public:
 #include "../../../tests/metal/metal_plan_profile_validation.inc"
 #include "../../../tests/metal/metal_pool_profile_validation.inc"
 #include "../../../tests/metal/metal_cache_profile_validation.inc"
+#include "../../../tests/metal/metal_oit_memory_validation.inc"
 #endif
 #endif
 }
@@ -3081,7 +3092,12 @@ void metalValidateRenderer()
 	vram.setRegion(testVRAM.data(), testVRAM.size());
 	try {
 #ifdef FLYCAST_METAL_TEST_FIXTURE_ROOT
-		if(metalOffscreenFixedPipelinesOnly){
+		if(metalOffscreenOITMemory){
+			const auto budget = config::PixelBufferSize.get();config::PixelBufferSize=1_MB;
+			struct RestoreBudget{int64_t value;~RestoreBudget(){config::PixelBufferSize=value;}} restore{budget};
+			MetalRenderer native(true);if(!native.Init())throw RendererException("Metal OIT memory initialization failed");
+			native.validateSyntheticOITMemory();native.Term();
+		} else if(metalOffscreenFixedPipelinesOnly){
 			for(bool perPixel:{false,true}){MetalRenderer native(perPixel);if(!native.Init())throw RendererException("Metal fixed pipeline initialization failed");native.validateSyntheticBackgroundPipelines();native.Term();}
 		} else if(metalOffscreenStorageAdmissionOnly){
 			MetalRenderer native(true);if(!native.Init())throw RendererException("Metal storage admission initialization failed");native.validateSyntheticStorageAdmission();native.Term();

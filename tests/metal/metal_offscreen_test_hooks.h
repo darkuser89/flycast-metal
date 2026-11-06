@@ -5,6 +5,7 @@
 #include <string>
 struct TA_context;
 extern std::function<void(TA_context *)> metalOffscreenParsedTa;
+extern std::function<void()> metalOffscreenDrawOSD;
 extern bool metalOffscreenRecoveryOnly;
 extern bool metalOffscreenMaterialAdmissionOnly;
 extern bool metalOffscreenFixedPipelinesOnly;
@@ -24,6 +25,9 @@ extern bool metalOffscreenPoolProfile,metalOffscreenPoolBenchmark;
 extern bool metalOffscreenReuseResidency;
 extern bool metalOffscreenCacheProfile,metalOffscreenCacheOptimized;
 extern bool metalOffscreenContextLifecycle;
+extern bool metalOffscreenOITMemory;
+extern bool metalOffscreenOITMemoryAsync;
+extern bool metalOffscreenOITMemoryUnpooledControl;
 extern std::string metalOffscreenCachePhase;
 struct MetalOffscreenAllocationStats { size_t calls=0,bytes=0; };
 void metalOffscreenBeginAllocations();

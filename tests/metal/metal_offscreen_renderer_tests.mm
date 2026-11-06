@@ -38,6 +38,9 @@ bool metalOffscreenPoolProfile=false,metalOffscreenPoolBenchmark=false;
 bool metalOffscreenReuseResidency=false;
 bool metalOffscreenCacheProfile=false,metalOffscreenCacheOptimized=true;
 bool metalOffscreenContextLifecycle=false;
+bool metalOffscreenOITMemory=false;
+bool metalOffscreenOITMemoryAsync=false;
+bool metalOffscreenOITMemoryUnpooledControl=false;
 std::string metalOffscreenCachePhase;
 static id<MTLTexture> lastDrawableTexture;
 id<MTLTexture> metalOffscreenTakeDrawableTexture(){auto image=lastDrawableTexture;lastDrawableTexture=nil;return image;}
@@ -115,7 +118,7 @@ FCMetal4Queue *metalOffscreenMakeQueue(id<MTLDevice> device){return [[FCOffscree
  auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:self.pixelFormat width:std::max<NSUInteger>(1,self.drawableSize.width) height:std::max<NSUInteger>(1,self.drawableSize.height) mipmapped:NO];
  d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
  auto result=[FCOffscreenDrawable new];result.texture=[self.device newTextureWithDescriptor:d];
- if(!result.texture)throw std::runtime_error("Cannot allocate offscreen drawable");if(metalOffscreenPoolProfile)lastDrawableTexture=result.texture;return result;
+ if(!result.texture)throw std::runtime_error("Cannot allocate offscreen drawable");if(metalOffscreenPoolProfile || metalOffscreenOITMemory)lastDrawableTexture=result.texture;return result;
 }
 @end
 void metalOffscreenRecreateContext()
@@ -242,6 +245,11 @@ int main(int argc,char **argv){@autoreleasepool{try {
  metalOffscreenResolveAdmissionOnly=metalOffscreenResolveBenchmark || (argc>1 && std::strcmp(argv[1],"--resolve-admission-only")==0);
 
  metalOffscreenContextLifecycle=argc>1 && std::strcmp(argv[1],"--context-lifecycle")==0;
+ metalOffscreenOITMemory=argc>1 && std::strcmp(argv[1],"--oit-memory-stress")==0;
+ if(metalOffscreenOITMemory)for(int i=2;i<argc;++i){
+  metalOffscreenOITMemoryAsync|=std::strcmp(argv[i],"--async")==0;
+  metalOffscreenOITMemoryUnpooledControl|=std::strcmp(argv[i],"--unpooled-control")==0;
+ }
  const bool pvrOnly=metalOffscreenContextLifecycle || (argc>1 && std::strcmp(argv[1],"--pvr-only")==0);
  metalOffscreenProofProfile=argc>1 && (std::strcmp(argv[1],"--proofs-validation")==0 || std::strcmp(argv[1],"--proofs-profile")==0);
  metalOffscreenProofBenchmark=argc>1 && std::strcmp(argv[1],"--proofs-profile")==0;

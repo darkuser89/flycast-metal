@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include "metal_offscreen_test_hooks.h"
 std::function<void(TA_context *)> metalOffscreenParsedTa;
+std::function<void()> metalOffscreenDrawOSD;
 bool metalOffscreenAllowExpectedNotification=false;
 unsigned metalOffscreenExpectedNotificationCount=0;
 settings_t settings;
@@ -80,7 +81,7 @@ void EventManager::registerEvent(Event event,Callback cb,void *p){unregisterEven
 void EventManager::unregisterEvent(Event event,Callback cb,void *p){auto& list=callbacks[size_t(event)];auto i=std::find(list.begin(),list.end(),std::make_pair(cb,p));if(i!=list.end())list.erase(i);}
 void EventManager::broadcastEvent(Event event){auto copy=callbacks[size_t(event)];for(auto& cb:copy)cb.first(event,cb.second);}
 void gui_updateStyle(){}
-void gui_display_osd(){}
+void gui_display_osd(){if(metalOffscreenDrawOSD)metalOffscreenDrawOSD();}
 void ta_parse(TA_context *context,bool){if(metalOffscreenParsedTa){metalOffscreenParsedTa(context);return;}unavailable("raw TA parser");}
 bool sdl_recreate_window(u32){unavailable("SDL window");return false;}
 bool sdl_update_display_metrics(SDL_Window *window,u32){if(window)unavailable("SDL display metrics");return false;}
