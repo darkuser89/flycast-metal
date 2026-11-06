@@ -1154,6 +1154,66 @@ void MetalRenderer::validateSynthetic()
 	fixture.lightModels[1] = {}; fixture.lightModels[1].ambientBase[0][2] = .5f;
 	fixture.global_param_tr.push_back(n2tr); fixture.render_passes[0].tr_count = 1;
 	check("Naomi2 production sorted translucency", 127, 0, 64);
+	if (perPixel) {
+		// Compare complete production GPU images against the former full-screen
+		// coverage bound. Many small projected polygons must not multiply draws
+		// merely because their original vertices are in Naomi2 model space.
+		const auto oldVertices = fixture.verts;
+		const auto oldIndices = fixture.idx;
+		const auto oldTranslucent = fixture.global_param_tr;
+		const auto oldMatrices = fixture.matrices;
+		const auto oldPass = fixture.render_passes[0];
+		const bool oldDense = disableDenseOIT, oldPacked = disablePackedOIT;
+		disableDenseOIT = disablePackedOIT = true;
+		fixture.global_param_tr.clear();
+		for (u32 i = 0; i < 64; ++i) {
+			const u32 first = fixture.verts.size();
+			const float x = float(i % 8) * 80 + 8, y = float(i / 8) * 60 + 8;
+			const bool projected = i % 5 != 0;
+			for (unsigned corner = 0; corner < 3; ++corner) {
+				Vertex v{};v.x = x + (corner == 1 ? 48 : 0);v.y = y + (corner == 2 ? 32 : 0);
+				v.z = projected ? -1.f : 1.f;
+				v.col[0] = u8(31 + i * 3);v.col[1] = u8(211 - i * 2);v.col[2] = u8(47 + i);v.col[3] = 128;
+				fixture.verts.push_back(v);fixture.idx.push_back(first + corner);
+			}
+			PolyParam poly = n2tr;poly.first = u32(fixture.idx.size()) - 3;poly.count = 3;
+			poly.constantColor[0] = true;poly.lightModel = -1;poly.isp.DepthMode = 7;
+			if (!projected) poly.mvMatrix = poly.normalMatrix = poly.projMatrix = -1;
+			fixture.global_param_tr.push_back(poly);
+		}
+		fixture.render_passes[0].tr_count = u32(fixture.global_param_tr.size());
+		unsigned reduced = 0;
+		for (unsigned variant = 0; variant < 6; ++variant) {
+			fixture.framebufferWidth = variant < 2 ? 64 : variant < 4 ? 96 : 160;
+			fixture.framebufferHeight = fixture.framebufferWidth * 3 / 4;
+			glm::mat4 model(1), project = projection;
+			model[3][0] = variant & 1 ? -17 : 0;
+			model[3][1] = variant & 1 ? 13 : 0;
+			// Distinct projection records catch a stale per-polygon vertex cache.
+			project[3][3] = variant & 1 ? .25f : 0;
+			memcpy(fixture.matrices[0].mat, glm::value_ptr(model), sizeof(N2Matrix));
+			memcpy(fixture.matrices[1].mat, glm::value_ptr(project), sizeof(N2Matrix));
+			std::vector<u8> bounded, full;
+			disableOITBounds = false;
+			if (!Render()) throw RendererException("Naomi2 bounded coverage render failed");
+			context()->readTexture(screen, bounded);
+			u32 bound = 0;bool dense = false;
+			const auto boundedTiles = oitTiles(0, fixture.global_param_tr.size(), bound, dense, false).size();
+			disableOITBounds = true;
+			if (!Render()) throw RendererException("Naomi2 full coverage reference render failed");
+			context()->readTexture(screen, full);
+			dense = false;
+			const auto fullTiles = oitTiles(0, fixture.global_param_tr.size(), bound, dense, false).size();
+			if (bounded != full) throw RendererException("Naomi2 projected bounds changed a production GPU pixel");
+			if (boundedTiles >= fullTiles) throw RendererException("Naomi2 projected bounds did not reduce OIT tiles");
+			++reduced;
+		}
+		disableOITBounds = false;disableDenseOIT = oldDense;disablePackedOIT = oldPacked;
+		fixture.verts = oldVertices;fixture.idx = oldIndices;fixture.global_param_tr = oldTranslucent;
+		fixture.matrices = oldMatrices;fixture.render_passes[0] = oldPass;
+		fixture.framebufferWidth = 64;fixture.framebufferHeight = 48;
+		NOTICE_LOG(RENDERER, "Metal validation PASS: Naomi2 projected OIT coverage, %u exact full production GPU image pairs with fewer tiles", reduced);
+	}
 	fixture.global_param_tr.clear(); fixture.render_passes[0].tr_count = 0;
 	n2.pcw.Shadow = 1;
 	fixture.modtrig = {{0,0,-.5f, 640,0,-.5f, 0,480,-.5f}, {640,0,-.5f, 640,480,-.5f, 0,480,-.5f}};

@@ -19,7 +19,9 @@ inline Tile coverageUnion(Tile a, Tile b)
 
 // Lifetime: one immutable vertex array/projection. Reset before a new render.
 // Reused strip vertices (also across passes) are transformed once, including
-// failed bounds. Noncanonical projections and Naomi2 stay unbounded.
+// failed bounds. Noncanonical projections stay unbounded. Naomi2 has a
+// separate, polygon-local projection cache because its matrices can change
+// even when a later polygon references the same vertex indices.
 class GeometryBounds {
 	struct Point {
 		double left = 0, top = 0, right = 0, bottom = 0;
@@ -29,6 +31,104 @@ class GeometryBounds {
 	std::array<std::array<float, 4>, 4> matrix;
 	Tile whole{};
 	bool canonical = false;
+	std::array<std::array<float, 4>, 4> naomi2MV{}, naomi2Projection{};
+	struct Naomi2Point { uint32_t index = ~0u; Point point; };
+	std::array<Naomi2Point, 4> naomi2Points{};
+	bool naomi2Configured = false;
+
+	struct Interval { double low, high; };
+	static Interval input(float value)
+	{
+		// Metal may flush subnormal operands to zero. Include either result,
+		// including for a subnormal matrix coefficient times a large vertex.
+		if (std::abs(value) < std::numeric_limits<float>::min())
+			return {std::min(0.0, double(value)), std::max(0.0, double(value))};
+		return {value, value};
+	}
+	static bool finite(Interval value)
+	{
+		return std::isfinite(value.low) && std::isfinite(value.high)
+			&& value.low <= value.high;
+	}
+	static Interval product(Interval a, Interval b)
+	{
+		const double values[]{a.low*b.low, a.low*b.high, a.high*b.low, a.high*b.high};
+		return {*std::min_element(values, values+4), *std::max_element(values, values+4)};
+	}
+	template<class Matrix> static bool transform(const Matrix& m,
+		const std::array<Interval, 4>& source, std::array<Interval, 4>& destination)
+	{
+		for (unsigned axis=0;axis<4;++axis) {
+			Interval sum{0,0};
+			double magnitude=0;
+			for(unsigned k=0;k<4;++k) {
+				if(!std::isfinite(m[k][axis]))return false;
+				const auto term=product(input(m[k][axis]),source[k]);
+				if(!finite(term))return false;
+				sum.low+=term.low;sum.high+=term.high;
+				magnitude+=std::max(std::abs(term.low),std::abs(term.high));
+			}
+			// Bound either separate float multiply/adds or contracted FMAs.
+			// Propagate the preceding stage's interval instead of precombining
+			// matrices: cancellation before the shader's division matters.
+			// Reject possible intermediate overflow even if the sum cancels.
+			if(!std::isfinite(magnitude) || magnitude>double(std::numeric_limits<float>::max())/4)return false;
+			const double error=magnitude*std::numeric_limits<float>::epsilon()*16
+				+double(std::numeric_limits<float>::min())*16;
+			destination[axis]={sum.low-error,sum.high+error};
+			if(!finite(destination[axis]))return false;
+		}
+		return true;
+	}
+	static bool divide(Interval numerator,Interval denominator,Interval& result)
+	{
+		if(!finite(denominator) || (denominator.low<=0 && denominator.high>=0))return false;
+		const double values[]{numerator.low/denominator.low,numerator.low/denominator.high,
+			numerator.high/denominator.low,numerator.high/denominator.high};
+		result={*std::min_element(values,values+4),*std::max_element(values,values+4)};
+		const double magnitude=std::max(std::abs(result.low),std::abs(result.high));
+		if(!finite(result) || magnitude>double(std::numeric_limits<float>::max())/4)return false;
+		const double error=magnitude*std::numeric_limits<float>::epsilon()*16
+			+double(std::numeric_limits<float>::min())*16;
+		result.low-=error;result.high+=error;
+		return true;
+	}
+	template<class Vertices> const Point *projectNaomi2(uint32_t index,const Vertices& vertices)
+	{
+		if(index>=vertices.size())return nullptr;
+		auto& cached=naomi2Points[index%naomi2Points.size()];
+		if(cached.index!=index){cached.index=index;cached.point={};}
+		auto& p=cached.point;
+		if(p.state!=Point::Unknown)return p.state==Point::Bounded ? &p : nullptr;
+		p.state=Point::Unbounded;
+		const auto& v=vertices[index];
+		std::array<Interval,4> source{input(v.x),input(v.y),input(v.z),Interval{1,1}},view,clip,projected,ndc;
+		for(const auto& value:source)if(!finite(value))return nullptr;
+		if(!transform(naomi2MV,source,view) || !transform(naomi2Projection,view,clip))return nullptr;
+		// Match pvrVertex: projection.xy/W, reciprocal W, then a new W=1.
+		// In particular, a finite negative projection W is not ordinary
+		// homogeneous clipping: the shader already divided before rasterizing.
+		if(!divide(clip[0],clip[3],projected[0]) || !divide(clip[1],clip[3],projected[1])
+			|| !divide({1,1},clip[3],projected[2]))return nullptr;
+		projected[3]={1,1};
+		if(!transform(matrix,projected,ndc))return nullptr;
+		// Shader Y negation and Metal's viewport Y inversion cancel, as in
+		// the ordinary PVR bounds. Four pixels cover raster subpixel rounding.
+		p.left=(ndc[0].low+1)*whole.width*.5-4;
+		p.right=(ndc[0].high+1)*whole.width*.5+4;
+		p.top=(ndc[1].low+1)*whole.height*.5-4;
+		p.bottom=(ndc[1].high+1)*whole.height*.5+4;
+		p.state=Point::Bounded;
+		return &p;
+	}
+	Tile bounds(const Point& a,const Point& b,const Point& c) const
+	{
+		const uint32_t x=uint32_t(std::clamp(std::floor(std::min({a.left,b.left,c.left})),0.0,double(whole.width)));
+		const uint32_t y=uint32_t(std::clamp(std::floor(std::min({a.top,b.top,c.top})),0.0,double(whole.height)));
+		const uint32_t endX=uint32_t(std::clamp(std::ceil(std::max({a.right,b.right,c.right})),0.0,double(whole.width)));
+		const uint32_t endY=uint32_t(std::clamp(std::ceil(std::max({a.bottom,b.bottom,c.bottom})),0.0,double(whole.height)));
+		return {x,y,endX-x,endY-y};
+	}
 
 	template<class Vertices> const Point *project(uint32_t index, const Vertices& vertices)
 	{
@@ -71,17 +171,38 @@ public:
 			&& m[0][2] == 0 && m[1][2] == 0 && m[3][2] == 0 && std::isnormal(m[2][2]) && m[2][2] > 0;
 		for (int k = 0; k < 4; ++k) for (int axis = 0; axis < 4; ++axis) matrix[k][axis] = m[k][axis];
 		points.assign(canonical ? vertexCount : 0,{});
+		naomi2Configured=false;
+	}
+	// Call for each polygon, using the exact model-view/projection values
+	// uploaded to its Naomi2 uniforms. Only four strip-cache entries reset;
+	// clearing a whole-frame vertex array per polygon would be quadratic.
+	template<class Matrix> void setNaomi2Projection(const Matrix& mv,const Matrix& projection)
+	{
+		for(unsigned k=0;k<4;++k)for(unsigned axis=0;axis<4;++axis) {
+			naomi2MV[k][axis]=mv[k][axis];naomi2Projection[k][axis]=projection[k][axis];
+		}
+		for(auto& p:naomi2Points)p={};
+		naomi2Configured=true;
+	}
+	template<class Vertices> Tile triangleNaomi2(const uint32_t *index,const Vertices& vertices)
+	{
+		if(!canonical || !naomi2Configured)return whole;
+		// Copy each result: direct-mapped cache collisions must not change an
+		// earlier point while the next vertex is projected.
+		Point p[3];
+		for(unsigned i=0;i<3;++i) {
+			const Point *point=projectNaomi2(index[i],vertices);
+			if(!point)return whole;
+			p[i]=*point;
+		}
+		return bounds(p[0],p[1],p[2]);
 	}
 	template<class Vertices> Tile triangle(const uint32_t *index, const Vertices& vertices, bool naomi2 = false)
 	{
 		if (!canonical || naomi2) return whole;
 		const Point *a = project(index[0], vertices), *b = project(index[1], vertices), *c = project(index[2], vertices);
 		if (!a || !b || !c) return whole;
-		const uint32_t x = uint32_t(std::clamp(std::floor(std::min({a->left, b->left, c->left})), 0.0, double(whole.width)));
-		const uint32_t y = uint32_t(std::clamp(std::floor(std::min({a->top, b->top, c->top})), 0.0, double(whole.height)));
-		const uint32_t endX = uint32_t(std::clamp(std::ceil(std::max({a->right, b->right, c->right})), 0.0, double(whole.width)));
-		const uint32_t endY = uint32_t(std::clamp(std::ceil(std::max({a->bottom, b->bottom, c->bottom})), 0.0, double(whole.height)));
-		return {x, y, endX - x, endY - y};
+		return bounds(*a,*b,*c);
 	}
 };
 }

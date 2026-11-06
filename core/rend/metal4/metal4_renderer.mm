@@ -2032,11 +2032,22 @@ class API_AVAILABLE(macos(26.0)) MetalRenderer final : public Renderer
 			if (poly.count < 3) continue;
 			if (poly.first > rc->idx.size() || poly.count > rc->idx.size() - poly.first)
 				throw RendererException("Metal OIT primitive index range is invalid");
+			const bool projected = poly.isNaomi2();
+			if (projected) {
+				// Use the immutable record consumed by this polygon's vertex shader,
+				// including its identity fallback for an unavailable matrix. Bounds
+				// must not reuse another polygon's model-view/projection cache.
+				const auto offset = naomi2Offsets[N2Translucent].at(p);
+				const auto& uniforms = *reinterpret_cast<const MetalNaomi2Uniforms *>(
+					static_cast<const u8 *>(naomi2.contents) + offset);
+				geometry.setNaomi2Projection(uniforms.mv, uniforms.projection);
+			}
 			metal_oit::Tile polygon{};
 			for (u32 i = 0; i + 2 < poly.count; ++i) {
 				const u32 *index = rc->idx.data() + poly.first + i;
 				if (index[0] == ~0u || index[1] == ~0u || index[2] == ~0u) continue;
-				const auto bounds = geometry.triangle(index, rc->verts, poly.isNaomi2());
+				const auto bounds = projected ? geometry.triangleNaomi2(index, rc->verts)
+					: geometry.triangle(index, rc->verts);
 				if (bounds.width && bounds.height) {
 					triangles.push_back(bounds);
 					metal_oit::TilePlanner::addCoverage(totalCoverage,bounds);
