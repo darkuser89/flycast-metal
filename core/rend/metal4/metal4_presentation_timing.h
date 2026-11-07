@@ -5,11 +5,22 @@
 #include <limits>
 
 namespace metal {
-// Keep one video field of producer buffering and headroom in the three-image
-// queue for arrival/callback jitter. The display's advance request is added
-// separately by PresentationTimeline. Two fields plus another refresh can fill
-// all slots before the first 60-Hz image is due. Even two fields alone can race
-// the callback when 59.94-Hz contents meet a 60-Hz display.
+// Five regular pending images cover the adaptive horizon and its boundary;
+// one extra slot absorbs a busy display callback. GPU replay stays two-deep.
+inline constexpr unsigned presentationQueueCapacity = 6;
+inline constexpr unsigned presentationCompositionCapacity = presentationQueueCapacity + 4;
+// Budget the full nominal callback-to-screen advance: one display period
+// before the CPU submission deadline, plus the deadline-to-screen lead.
+// Omitting that period consumes it from the producer's video-field buffer.
+inline double displaySchedulingLead(double deadline, double presentation, double refreshRate)
+{
+	if (!std::isfinite(deadline) || !std::isfinite(presentation) || !std::isfinite(refreshRate)
+			|| refreshRate <= 0 || presentation < deadline) return 0;
+	const double lead = presentation - deadline + 1 / refreshRate;
+	return std::isfinite(lead) && lead > 0 && lead < 1 ? lead : 0;
+}
+// Start with one video field. PresentationTimeline can retain more of the
+// producer's arrival variation without changing the emulated source clock.
 inline double presentationBufferDuration(double videoFieldDuration)
 {
 	return videoFieldDuration;
@@ -18,27 +29,38 @@ inline double presentationBufferDuration(double videoFieldDuration)
 // not be added to every subsequent frame or duplicate presentation.
 class PresentationTimeline {
 public:
-	void reset() { source = 0; host = 0; previous = -1; }
+	void reset() { source = 0; host = 0; previous = -1; previousHost = 0; previousTarget = 0; }
 	// Source time is captured at the emulated video swap that produced the
 	// image, retaining sub-field precision. No assumed 30/60 Hz game rate and no accumulated host jitter.
 	double videoFrame(double now, double videoTime, double latency, double displayLead = 0) {
 		if (!std::isfinite(now) || !std::isfinite(videoTime) || !std::isfinite(latency)
 				|| !std::isfinite(displayLead) || displayLead < 0 || latency <= 0) { reset(); return 0; }
 		double target = host + videoTime - source;
-		// Audio/emulation can initially run ahead in a burst. Deadlines
-		// beyond the composition horizon evict images before they are due.
-		// Rebase that phase instead of chasing an ever-future mailbox.
-		if (previous < 0 || videoTime < previous || videoTime - previous > 1
-				|| now - target > 0.1 || target - now > latency + 1e-6) {
+		const bool restart = previous < 0 || videoTime < previous || videoTime - previous > 1
+				|| now < previousHost;
+		if (restart) {
 			source = videoTime; host = now + latency; target = host;
+		} else {
+			// A heavier render phase can exhaust the initial field of buffering.
+			// Move the host phase only by the missing margin, not by a full field
+			// on every late arrival. A wider upper boundary supplies hysteresis;
+			// early arrivals must not immediately undo the late-arrival correction.
+			// Outside this bounded horizon, catch-up bursts may still overflow the
+			// display queue. Never turn them into unlimited latency or CPU waits.
+			double bounded = std::clamp(target, now + latency * .5, now + latency * 3.5);
+			// A field-mode or display-lead change must not timestamp a newer
+			// queued image before an older one. Drain that short transition in FIFO order.
+			bounded = std::max(bounded, previousTarget - displayLead);
+			if (bounded != target) { source = videoTime; host = bounded; target = bounded; }
 		}
-		previous = videoTime;
+		previous = videoTime; previousHost = now;
 		// Producer buffering and the display's advance request are different
 		// intervals. Only producer buffering bounds the pending image queue.
-		return target + displayLead;
+		previousTarget = target + displayLead;
+		return previousTarget;
 	}
 private:
-	double source = 0, host = 0, previous = -1;
+	double source = 0, host = 0, previous = -1, previousHost = 0, previousTarget = 0;
 };
 // Explicit repeats follow the emulated video field, including PAL/NTSC and
 // interval-2 games. Carry fractional refreshes across source frames instead of

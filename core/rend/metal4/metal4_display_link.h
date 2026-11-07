@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
-#import <QuartzCore/CADisplayLink.h>
+#import <QuartzCore/CAMetalDisplayLink.h>
 #pragma push_macro("Rect")
 #pragma push_macro("RGBColor")
 #define Rect MacOSRect
@@ -12,6 +12,7 @@
 #include <deque>
 #include <thread>
 #include "metal4_upload_state.h"
+#include "metal4_presentation_timing.h"
 
 // Immutable commands and leased source/UI snapshots cross from the producer
 // to this display queue; drawables remain exclusively on the display thread.
@@ -22,6 +23,7 @@ struct API_AVAILABLE(macos(26.0)) MetalDisplayState {
 	std::atomic<bool> active{false};
 	std::atomic<bool> failed{false};
 	std::atomic<double> schedulingLead{0};
+	double refreshRate = 60;
 	CAMetalLayer *layer;
 	FCMetal4Queue *queue;
 	id<MTLRenderPipelineState> pipeline;
@@ -36,7 +38,7 @@ struct API_AVAILABLE(macos(26.0)) MetalDisplayState {
 };
 
 API_AVAILABLE(macos(26.0))
-@interface FCMetalDisplayDelegate : NSObject
+@interface FCMetalDisplayDelegate : NSObject <CAMetalDisplayLinkDelegate>
 - (instancetype)initWithState:(std::shared_ptr<MetalDisplayState>)state;
 @end
 @implementation FCMetalDisplayDelegate {
@@ -47,7 +49,7 @@ API_AVAILABLE(macos(26.0))
 	if ((self = [super init])) _state = std::move(state);
 	return self;
 }
-- (void)displayUpdate:(CADisplayLink *)link
+- (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update
 {
 	@autoreleasepool {
 		auto state = _state;
@@ -59,17 +61,18 @@ API_AVAILABLE(macos(26.0))
 			std::lock_guard<std::mutex> lock(state->mutex);
 			state->needsPresent=bool(state->visible);
 		}
-		// The immutable image is ready to replay. Follow this view's next display
-		// tick rather than acquiring a drawable several refreshes in advance.
-		const double lead = link.targetTimestamp - link.timestamp;
-		if (std::isfinite(lead) && lead > 0 && lead < 1)
+		// Metal supplies a drawable for this update. Select source images for
+		// its estimated screen time; targetTimestamp is the CPU present deadline.
+		const double target = update.targetPresentationTimestamp;
+		const double deadline = update.targetTimestamp;
+		const double lead = metal::displaySchedulingLead(deadline,target,state->refreshRate);
+		if (lead > 0)
 			state->schedulingLead = lead;
 		{
 			std::lock_guard<std::mutex> lock(state->mutex);
-			const bool due = !state->pending.empty() && state->pending.front()->target <= link.targetTimestamp;
-			// With repetition disabled, keep an idle callback from acquiring a
-			// drawable it cannot present. Do not advance the pending queue here:
-			// GPU capacity and a drawable must be reserved first.
+			const bool due = !state->pending.empty() && state->pending.front()->target <= target;
+			// With repetition disabled, leave an idle update unused. Do not advance
+			// the pending queue until GPU capacity and its drawable are available.
 			if (!due && (!state->visible || (!state->repeats && !state->needsPresent))) return;
 		}
 		// Reserve GPU capacity before advancing the visible image. Otherwise a
@@ -78,7 +81,7 @@ API_AVAILABLE(macos(26.0))
 			++state->busy; return;
 		}
 		id<CAMetalDrawable> drawable;
-		@try { drawable = [state->layer nextDrawable]; }
+		@try { drawable = update.drawable; }
 		@catch (NSException *failure) {
 			dispatch_semaphore_signal(state->flight);
 			ERROR_LOG(RENDERER, "Metal display drawable: %s", failure.reason.UTF8String);
@@ -93,7 +96,7 @@ API_AVAILABLE(macos(26.0))
 			// update can show one new image; consuming several here drops frames.
 			// The native GPU event below orders the producer and copy without
 			// waiting for GPU completion on the display or emulation thread.
-			if (!state->pending.empty() && state->pending.front()->target <= link.targetTimestamp) {
+			if (!state->pending.empty() && state->pending.front()->target <= target) {
 				state->visible = std::move(state->pending.front());
 				state->pending.pop_front(); changed = true;state->needsPresent=true;
 			}
@@ -159,12 +162,12 @@ API_AVAILABLE(macos(26.0))
 					ERROR_LOG(RENDERER, "Metal display: %s", finished.error.localizedDescription.UTF8String);
 				}
 			}];
-			if (state->timing && state->presentations < 18000) {
+			if (state->timing && state->presentations < 36000) {
 				const u64 number = ++state->presentations, content = image->content;
 				if (changed)
 					NOTICE_LOG(RENDERER, "Metal display submit %llu: now %.6f deadline %.6f target %.6f image %.6f ready %d content %llu",
-						(unsigned long long)number, CACurrentMediaTime(), link.targetTimestamp,
-						link.targetTimestamp, image->target,
+						(unsigned long long)number, CACurrentMediaTime(), deadline,
+						target, image->target,
 						image->readyEvent.signaledValue >= image->readyValue, (unsigned long long)content);
 				[drawable addPresentedHandler:^(id<MTLDrawable> drawable) {
 					NOTICE_LOG(RENDERER, "Metal display presented %llu: %.6f s content %llu", (unsigned long long)number, drawable.presentedTime, (unsigned long long)content);
@@ -190,21 +193,27 @@ class API_AVAILABLE(macos(26.0)) MetalDisplayLink {
 	std::shared_ptr<MetalDisplayState> state = std::make_shared<MetalDisplayState>();
 	std::thread thread;
 	CFRunLoopRef runLoop = nullptr;
-	CADisplayLink *link;
+	CAMetalDisplayLink *link;
+	// CAMetalDisplayLink keeps only a weak delegate reference.
+	__strong FCMetalDisplayDelegate *delegate;
 public:
-	MetalDisplayLink(NSView *view, CAMetalLayer *layer, FCMetal4Queue *queue, id<MTLRenderPipelineState> pipeline,
+	MetalDisplayLink(NSView *, CAMetalLayer *layer, FCMetal4Queue *queue, id<MTLRenderPipelineState> pipeline,
 		id<MTLSamplerState> sampler, dispatch_group_t submissions, bool timing, double refresh) {
 		// Drawable waits must not stall the game's native Metal 4 queue.
 		state->queue = [[FCMetal4Queue alloc] initWithDevice:queue.device]; state->pipeline = pipeline; state->sampler = sampler;
 		state->submissions = submissions; state->timing = timing; state->layer = layer;
 		dispatch_semaphore_t ready = dispatch_semaphore_create(0);
-		// Create the view-bound clock on the SDL/AppKit thread. Only its
-		// callbacks and drawable acquisition run on the display thread.
-		FCMetalDisplayDelegate *delegate = [[FCMetalDisplayDelegate alloc] initWithState:state];
-		link = [view displayLinkWithTarget:delegate selector:@selector(displayUpdate:)];
+		// Create the layer-bound clock on the SDL/AppKit thread. Metal delivers
+		// its prepared drawable to the delegate on the display run loop.
+		delegate = [[FCMetalDisplayDelegate alloc] initWithState:state];
+		link = [[CAMetalDisplayLink alloc] initWithMetalLayer:layer];
+		if (!delegate || !link) throw RendererException("Cannot create Metal display clock");
+		link.delegate = delegate;
 		link.paused = YES;
-		if (std::isfinite(refresh) && refresh > 0)
+		if (std::isfinite(refresh) && refresh > 0) {
+			state->refreshRate = refresh;
 			link.preferredFrameRateRange = CAFrameRateRangeMake(refresh, refresh, refresh);
+		}
 		thread = std::thread([this, ready] {
 			@autoreleasepool {
 				pthread_setname_np("Flycast Metal display");
@@ -268,7 +277,7 @@ public:
 		// delayed CPU feedback must not become an extra frame of latency.
 		std::lock_guard<std::mutex> lock(state->mutex);
 		if (!state->active) return;
-		if (state->pending.size() == 3) { state->pending.pop_front(); ++state->evicted; }
+		if (state->pending.size() == metal::presentationQueueCapacity) { state->pending.pop_front(); ++state->evicted; }
 		state->pending.push_back(image);
 	}
 };

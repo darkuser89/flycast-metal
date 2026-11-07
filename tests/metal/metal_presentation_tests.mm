@@ -55,8 +55,16 @@ void GenericLog(LogTypes::LOG_LEVELS,LogTypes::LOG_TYPE,const char*,int,const ch
     return _lastCommands;
 }
 @end
+@class OffscreenDrawable;
+@interface OffscreenLayer : NSObject
+@property (strong) id<MTLDevice> device;
+@property NSUInteger width,height,acquisitions,supplied,manualAcquisitions;
+@property (strong) OffscreenDrawable *last;
+- (id<CAMetalDrawable>)providedDrawable;
+@end
 @interface OffscreenDrawable : NSObject <CAMetalDrawable>
 @property (strong) id<MTLTexture> texture;
+@property (weak) OffscreenLayer *owner;
 @property (readonly) CAMetalLayer *layer;
 @property (readonly) NSUInteger drawableID;
 @property (readonly) CFTimeInterval presentedTime;
@@ -66,26 +74,33 @@ void GenericLog(LogTypes::LOG_LEVELS,LogTypes::LOG_TYPE,const char*,int,const ch
 - (CAMetalLayer *)layer {return nil;}
 - (NSUInteger)drawableID {return (NSUInteger)(__bridge void *)self;}
 - (CFTimeInterval)presentedTime {return 0;}
-- (void)present {++_presents;}
+- (void)present {++_presents;++_owner.acquisitions;_owner.last=self;}
 - (void)presentAtTime:(CFTimeInterval)time {[self present];}
 - (void)presentAfterMinimumDuration:(CFTimeInterval)duration {[self present];}
 - (void)addPresentedHandler:(MTLDrawablePresentedHandler)handler {}
 @end
-@interface OffscreenLayer : NSObject
-@property (strong) id<MTLDevice> device;
-@property NSUInteger width,height,acquisitions;
-@property (strong) OffscreenDrawable *last;
-@end
 @implementation OffscreenLayer
 - (id<CAMetalDrawable>)nextDrawable {
-    ++_acquisitions;_last=[OffscreenDrawable new];auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:_width height:_height mipmapped:NO];
-    d.storageMode=MTLStorageModePrivate;d.hazardTrackingMode=MTLHazardTrackingModeUntracked;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;_last.texture=[_device newTextureWithDescriptor:d];return _last;
+    ++_manualAcquisitions;@throw [NSException exceptionWithName:@"UnexpectedManualDrawable" reason:@"CAMetalDisplayLink already supplies its drawable" userInfo:nil];
+}
+- (id<CAMetalDrawable>)providedDrawable {
+    ++_supplied;auto output=[OffscreenDrawable new];output.owner=self;
+    auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:_width height:_height mipmapped:NO];
+    d.storageMode=MTLStorageModePrivate;d.hazardTrackingMode=MTLHazardTrackingModeUntracked;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;output.texture=[_device newTextureWithDescriptor:d];return output;
 }
 @end
 @interface DisplayTick : NSObject
-@property CFTimeInterval timestamp,targetTimestamp;
+@property CFTimeInterval targetTimestamp,targetPresentationTimestamp;
+@property (nonatomic, strong) id<CAMetalDrawable> drawable;
+@property BOOL throwOnDrawable;
 @end
-@implementation DisplayTick @end
+@implementation DisplayTick
+@synthesize drawable=_drawable;
+- (id<CAMetalDrawable>)drawable {
+    if(_throwOnDrawable)@throw [NSException exceptionWithName:@"SyntheticDrawableFailure" reason:@"Injected supplied-drawable getter failure" userInfo:nil];
+    return _drawable;
+}
+@end
 struct alignas(16) Quad {float color[4];uint32_t rotate,ignoreAlpha;};
 struct UIVertex {float x,y,u,v;uint8_t color[4];};
 struct alignas(16) Gun {float rectangle[4],color[4];};
@@ -164,14 +179,18 @@ struct GPU {
 };
 struct Display {
     std::shared_ptr<MetalDisplayState> state=std::make_shared<MetalDisplayState>();
-    OffscreenLayer *layer=[OffscreenLayer new];OffscreenQueue *queue;FCMetalDisplayDelegate *delegate;DisplayTick *tick=[DisplayTick new];
+    OffscreenLayer *layer=[OffscreenLayer new];OffscreenQueue *queue;FCMetalDisplayDelegate *delegate;DisplayTick *tick=[DisplayTick new];bool omitDrawable=false;
     Display(GPU& g,NSUInteger w,NSUInteger h) {
         queue=[[OffscreenQueue alloc] initWithDevice:g.device];layer.device=g.device;layer.width=w;layer.height=h;
-        state->queue=queue;state->layer=(CAMetalLayer *)layer;state->pipeline=g.quad;state->sampler=g.nearest;state->submissions=dispatch_group_create();state->active=true;state->repeats=true;
-        delegate=[[FCMetalDisplayDelegate alloc] initWithState:state];tick.timestamp=99;tick.targetTimestamp=100;
+        state->queue=queue;state->layer=(CAMetalLayer *)layer;state->pipeline=g.quad;state->sampler=g.nearest;state->submissions=dispatch_group_create();state->active=true;state->repeats=true;state->refreshRate=120;
+        delegate=[[FCMetalDisplayDelegate alloc] initWithState:state];tick.targetTimestamp=100-1./120;tick.targetPresentationTimestamp=100;
     }
     ~Display(){wait();state->active=false;state->pending.clear();state->visible.reset();queue.lastCommands=nil;}
-    void update(){[delegate displayUpdate:(CADisplayLink *)tick];}
+    void update(){
+        tick.drawable=omitDrawable?nil:[layer providedDrawable];
+        [delegate metalDisplayLink:(CAMetalDisplayLink *)(id)tick needsUpdate:(CAMetalDisplayLinkUpdate *)tick];tick.drawable=nil;
+        require(!layer.manualAcquisitions,"Display callback acquired a second drawable instead of using the supplied one");
+    }
     void wait(){dispatch_group_wait(state->submissions,DISPATCH_TIME_FOREVER);if(queue.lastCommands)error(queue.lastCommands.error);}
     void publish(const std::shared_ptr<MetalDisplayImage>& image){std::lock_guard<std::mutex> lock(state->mutex);state->pending.push_back(image);}
 };
@@ -284,7 +303,7 @@ static void busyAndSnapshots(GPU& g) {
     auto available=dispatch_semaphore_create(1);
     Display display(g,67,49);auto packet=image(g,67,49,31,nil,available);auto next=image(g,67,49,0);next->content=900;
     auto gate=[g.device newSharedEvent];[display.queue.native waitForEvent:gate value:1];display.publish(packet);display.update();auto firstCommands=display.queue.lastCommands;
-    display.state->repeats=false;const auto acquisitions=display.layer.acquisitions;display.update();require(display.layer.acquisitions==acquisitions,"Idle non-repeating display acquired a drawable");
+    display.state->repeats=false;const auto acquisitions=display.layer.acquisitions;display.update();require(display.layer.acquisitions==acquisitions,"Idle non-repeating display submitted its supplied drawable");
     display.state->repeats=true;display.update();display.publish(next);display.update();
     const bool preserved=display.state->pending.size()==1 && display.state->visible==packet && display.state->busy==1;
     // Mutate the original renderer image while the display GPU is stopped.
@@ -297,13 +316,54 @@ static void busyAndSnapshots(GPU& g) {
     display.update();display.wait();require(display.state->visible==next && display.state->pending.empty(),"Next content image was not consumed in source order");
     std::puts("PASS display ownership: two in-flight replays, busy reservation preserves pending order, repeats on/off, frozen source, lease held through GPU reads after CPU owners clear and released at completion");
 }
+static void metalUpdateContract(GPU& g) {
+    Display display(g,80,64);display.state->repeats=false;
+    auto packet=image(g,64,48,16);packet->target=100.005;display.publish(packet);
+    // Metal's commit deadline and eventual presentation time are different.
+    // A content timestamp between them is already due for this supplied surface.
+    display.tick.targetTimestamp=100;display.tick.targetPresentationTimestamp=100.010;
+    display.update();display.wait();
+    require(display.state->visible==packet && display.state->pending.empty() && display.layer.acquisitions==1,
+        "Metal update selected content against the commit deadline instead of presentation time");
+    require(std::abs(display.state->schedulingLead.load()-(.010+1./120))<1.e-9,"Metal update omitted its full callback-to-presentation lookahead");
+    display.state->refreshRate=0;display.update();
+    require(std::abs(display.state->schedulingLead.load()-(.010+1./120))<1.e-9,"Invalid refresh erased the last valid Metal callback lookahead");
+    display.state->refreshRate=120;
+    auto expected=reference(g,64,48,16,80,64);
+    require(g.pixels(expected)==g.pixels(display.layer.last.texture),"Supplied drawable or dimensions did not reach the production renderer");
+    auto next=image(g,64,48,0);next->target=100.020;next->content=900;display.publish(next);
+    display.tick.targetTimestamp=100.014;display.tick.targetPresentationTimestamp=100.015;
+    display.update();
+    require(display.state->visible==packet && display.state->pending.size()==1 && display.layer.acquisitions==1,
+        "Metal update promoted a future packet or submitted an idle non-repeating surface");
+    display.tick.targetTimestamp=100.012;display.tick.targetPresentationTimestamp=100.020;
+    display.update();display.wait();
+    require(display.state->visible==next && display.state->pending.empty() && display.layer.acquisitions==2,
+        "Metal update failed to select a packet exactly at its presentation timestamp");
+    auto blocked=image(g,64,48,31);blocked->content=901;blocked->target=100.025;display.publish(blocked);
+    display.tick.targetTimestamp=100.022;display.tick.targetPresentationTimestamp=100.030;
+    display.omitDrawable=true;display.update();flightCount(display.state->flight,2);
+    require(display.state->visible==next && display.state->pending.front()==blocked && display.layer.acquisitions==2,
+        "Missing supplied drawable consumed content or a display flight slot");
+    display.omitDrawable=false;display.tick.throwOnDrawable=true;display.update();flightCount(display.state->flight,2);
+    require(display.state->visible==next && display.state->pending.front()==blocked && display.layer.acquisitions==2,
+        "Supplied drawable getter failure consumed content or a display flight slot");
+    display.tick.throwOnDrawable=false;display.update();display.wait();flightCount(display.state->flight,2);
+    require(display.state->visible==blocked && display.state->pending.empty() && display.layer.acquisitions==3,
+        "Valid supplied drawable failed to recover after missing/throwing updates");
+    expected=reference(g,64,48,31,80,64);
+    require(g.pixels(expected)==g.pixels(display.layer.last.texture),"Supplied drawable recovery changed the complete image");
+    display.state->active=false;display.tick.throwOnDrawable=true;display.update();
+    require(display.layer.acquisitions==3 && !display.layer.manualAcquisitions,"Inactive Metal callback used its drawable");
+    std::puts("PASS Metal display update: presentation timestamp differs from commit deadline; exact/future content selection; supplied drawable dimensions and complete images; nil/throwing/inactive updates conserve queue order and flight leases; no manual nextDrawable acquisition");
+}
 static void deadlineController(GPU& g) {
     uint64_t newImages=0,outputs=0;
     for(double videoHz:{50.,60000./1001,60.})for(unsigned interval:{1u,2u})
     for(unsigned hostHz:{60u,120u})for(bool repeats:{false,true}) {@autoreleasepool {
         // Two independent production display queues share immutable packets.
         // Host timestamps are synthetic. This does not measure real VBlank.
-        Display first(g,67,49),second(g,67,49);first.state->repeats=second.state->repeats=repeats;
+        Display first(g,67,49),second(g,67,49);first.state->repeats=second.state->repeats=repeats;first.state->refreshRate=second.state->refreshRate=hostHz;
         unsigned produced=0,changed=0;uint64_t previous=0;
         for(unsigned tick=0;tick<=2*hostHz;++tick) {@autoreleasepool {
             const double deadline=100.+double(tick)/hostHz;
@@ -314,7 +374,7 @@ static void deadlineController(GPU& g) {
                 first.publish(packet);second.publish(packet);++newImages;
             }
             const auto before=first.layer.acquisitions;
-            for(auto display:{&first,&second}){display->tick.targetTimestamp=deadline;display->tick.timestamp=deadline-1./hostHz;display->update();}
+            for(auto display:{&first,&second}){display->tick.targetPresentationTimestamp=deadline;display->tick.targetTimestamp=deadline-1./hostHz;display->update();}
             first.wait();second.wait();
             const uint64_t visible=first.state->visible?first.state->visible->content:0;
             require(visible==expected && (second.state->visible?second.state->visible->content:0)==expected,"Display changed the source-content cadence/order");
@@ -323,12 +383,12 @@ static void deadlineController(GPU& g) {
             // Independent count: each new content presents once, or every host
             // tick after the first image when explicit repetition is enabled.
             const uint64_t expectedOutputs=repeats && expected?tick:produced;
-            require(first.layer.acquisitions==expectedOutputs && second.layer.acquisitions==expectedOutputs,"Duplicate/idle drawable acquisition policy changed");
+            require(first.layer.acquisitions==expectedOutputs && second.layer.acquisitions==expectedOutputs,"Duplicate/idle supplied-drawable output policy changed");
             outputs+=first.layer.acquisitions-before;
         }}
         require(changed==produced,"Not every source content image reached display");
     }}
-    std::printf("PASS deadline controller: 24 PAL/NTSC 50/59.94/60 Hz and interval-2 cases, synthetic 60/120 Hz ticks, repeats on/off, two independent queues, %llu new shared images and %llu outputs per view, no skipped source images\n",(unsigned long long)newImages,(unsigned long long)outputs);
+    std::printf("PASS deadline controller: 24 PAL/NTSC 50/59.94/60 Hz and interval-2 cases, distinct commit/presentation timestamps at synthetic 60/120 Hz, repeats on/off, two independent queues, %llu new shared images and %llu outputs per view, no skipped source images\n",(unsigned long long)newImages,(unsigned long long)outputs);
 }
 static void fxSnapshots(GPU& g) {
     MetalFXUpscaler fx(g.device,g.compiler);require(fx.supported(),"Metal 4 FX unavailable: cannot claim FX presentation coverage");
@@ -456,4 +516,4 @@ static void fallbackBenchmark(GPU& g,bool timing,bool compareDeferred=false) {
             (unsigned long long)composed.intermediateBytes(),(unsigned long long)fallback.intermediateBytes(),(unsigned long long)fallback.transientSnapshotBytes);std::fflush(stdout);
     }}
 }
-int main(int argc,char **argv){@autoreleasepool{try{GPU g;if(argc==2 && std::strcmp(argv[1],"--benchmark-only")==0)benchmark(g);else if(argc==2 && std::strcmp(argv[1],"--fallback-benchmark-only")==0)fallbackBenchmark(g,true);else if(argc==2 && std::strcmp(argv[1],"--fallback-validation-only")==0)fallbackBenchmark(g,false);else if(argc==2 && std::strcmp(argv[1],"--deferred-benchmark-only")==0)fallbackBenchmark(g,true,true);else if(argc==2 && std::strcmp(argv[1],"--deferred-validation-only")==0)fallbackBenchmark(g,false,true);else if(argc==2 && std::strcmp(argv[1],"--shutdown-only")==0)failedPresentation(g);else{validation(g);deferredGuards(g);deadlineController(g);fxSnapshots(g);busyAndSnapshots(g);failedPresentation(g);}return 0;}catch(const std::exception& e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}}}
+int main(int argc,char **argv){@autoreleasepool{try{GPU g;if(argc==2 && std::strcmp(argv[1],"--benchmark-only")==0)benchmark(g);else if(argc==2 && std::strcmp(argv[1],"--fallback-benchmark-only")==0)fallbackBenchmark(g,true);else if(argc==2 && std::strcmp(argv[1],"--fallback-validation-only")==0)fallbackBenchmark(g,false);else if(argc==2 && std::strcmp(argv[1],"--deferred-benchmark-only")==0)fallbackBenchmark(g,true,true);else if(argc==2 && std::strcmp(argv[1],"--deferred-validation-only")==0)fallbackBenchmark(g,false,true);else if(argc==2 && std::strcmp(argv[1],"--shutdown-only")==0)failedPresentation(g);else{validation(g);deferredGuards(g);metalUpdateContract(g);deadlineController(g);fxSnapshots(g);busyAndSnapshots(g);failedPresentation(g);}return 0;}catch(const std::exception& e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}}}

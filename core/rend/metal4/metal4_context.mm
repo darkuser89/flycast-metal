@@ -216,10 +216,9 @@ struct MetalContext::Impl
 		PresentationResources resources;
 	};
 	size_t compositionSlot = 0;
-	// Three queued images, one visible image, two display GPU readers and
-	// one producer. A four-slot pool drops valid 60-FPS frames even when
-	// neither GPU queue is overloaded.
-	std::array<CompositionSlot, 7> compositions;
+	// Pending images, one visible image, two display GPU readers and one
+	// producer each retain their own lease; none can overwrite a GPU reader.
+	std::array<CompositionSlot, metal::presentationCompositionCapacity> compositions;
 	size_t nextComposition = 0;
 	bool frameTimings = false;
 	u64 profilingLimit = 900;
@@ -1518,15 +1517,18 @@ void MetalContext::present()
 			if (routingClients) publishVideoRouting(impl->composition->texture, impl->frame);
 			else if (!config::VideoRouting) os_VideoRoutingTermMetal();
 #endif
-			impl->composition->target = impl->presentationTimeline.videoFrame(CACurrentMediaTime(),
-				impl->sourceVideoTime, metal::presentationBufferDuration(spg_GetFrameDuration()), impl->displayLink->schedulingLead());
-			if (impl->presentationTimings && impl->contentFrame <= 3600)
-				NOTICE_LOG(RENDERER, "Metal video %llu: source %.6f target %.6f submitted %.6f",
-					(unsigned long long)impl->contentFrame, impl->sourceVideoTime,
-					impl->composition->target, CACurrentMediaTime());
 			impl->displayLink->prepare(impl->composition, impl->frame);
 			submitCommandBuffer(impl->frame);
+			// The producer is publishable only after native submission. A slow
+			// commit must not consume the display timeline's buffering margin.
+			const double submitted = CACurrentMediaTime();
+			impl->composition->target = impl->presentationTimeline.videoFrame(submitted,
+				impl->sourceVideoTime, metal::presentationBufferDuration(spg_GetFrameDuration()), impl->displayLink->schedulingLead());
 			impl->displayLink->enqueue(impl->composition);
+			if (impl->presentationTimings && impl->contentFrame <= impl->profilingLimit)
+				NOTICE_LOG(RENDERER, "Metal video %llu: source %.6f target %.6f submitted %.6f enqueued %.6f",
+					(unsigned long long)impl->contentFrame, impl->sourceVideoTime,
+					impl->composition->target, submitted, CACurrentMediaTime());
 			impl->queuedContent=impl->composition->content;
 			impl->composition.reset(); impl->frame = nil; impl->drawableRequested = false;
 			return;
